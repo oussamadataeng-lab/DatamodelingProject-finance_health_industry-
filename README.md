@@ -1,41 +1,98 @@
-# Data modeling — finance, santé, industrie
+# Comptes bancaires — OLTP
 
-Six petits projets de modélisation de données, un peu comme des exercices pratiques. Le point de départ : prendre trois domaines qui n'ont rien à voir (une banque, un hôpital, une usine) et, pour chacun, construire deux bases qui ne se ressemblent pas du tout — une base "métier" qui encaisse les opérations du quotidien (OLTP), et un entrepôt fait pour analyser tout ça après coup (OLAP).
+Base transactionnelle d'une banque : ouverture de comptes (parfois joints), cartes associées, et chaque mouvement (dépôt, retrait, virement, paiement) enregistré en temps réel. Le point sensible : un virement doit débiter et créditer dans la même transaction, sans jamais perdre de cohérence.
 
-Pour chaque projet j'ai suivi la même démarche en trois temps, la méthode Merise si on veut lui donner un nom : d'abord repérer les entités et comment elles se relient (le conceptuel), ensuite traduire ça en tables avec clés primaires et étrangères (le logique), et enfin écrire le vrai SQL avec les types, contraintes et index (le physique, dans `schema.sql`, testé sur PostgreSQL).
+## MCD
 
-L'objectif n'est pas d'avoir un système prêt pour la prod, mais de montrer sur des cas concrets pourquoi une base qui enregistre des transactions ne se modélise pas du tout comme une base faite pour repérer des tendances sur plusieurs années.
-
-## Projets
-
-| Domaine | Type | Dossier | Sujet |
-|---|---|---|---|
-| Finance | OLTP | [`finance/oltp-comptes-bancaires`](finance/oltp-comptes-bancaires) | comptes, cartes, transactions |
-| Finance | OLAP | [`finance/olap-risque-credit`](finance/olap-risque-credit) | entrepôt risque de crédit |
-| Santé | OLTP | [`sante/oltp-dossier-patient`](sante/oltp-dossier-patient) | dossier patient, consultations, prescriptions |
-| Santé | OLAP | [`sante/olap-epidemiologie`](sante/olap-epidemiologie) | entrepôt de surveillance épidémiologique |
-| Industrie | OLTP | [`industrie/oltp-gestion-production`](industrie/oltp-gestion-production) | suivi de production type MES |
-| Industrie | OLAP | [`industrie/olap-performance-industrielle`](industrie/olap-performance-industrielle) | entrepôt TRS/OEE |
-
-Voir [`docs/methodologie.md`](docs/methodologie.md) pour le détail de la démarche (Merise + OLTP vs OLAP).
-
-## Structure d'un projet
-
-```
-<projet>/
-├── README.md    # contexte, MCD, MLD (diagrammes Mermaid + cardinalités)
-└── schema.sql    # DDL exécutable (volet physique)
+```mermaid
+erDiagram
+    CLIENT ||--o{ CLIENT_COMPTE : possède
+    COMPTE ||--o{ CLIENT_COMPTE : "est possédé par"
+    AGENCE ||--o{ COMPTE : gère
+    AGENCE ||--o{ EMPLOYE : emploie
+    EMPLOYE |o--o{ CLIENT : conseille
+    COMPTE ||--o{ CARTE : possède
+    COMPTE ||--o{ TRANSACTION : "est source de"
+    COMPTE |o--o{ TRANSACTION : "est destinataire de"
 ```
 
-## Tester un schéma
+| Entité 1 | Association | Entité 2 | Card. E1 | Card. E2 |
+|---|---|---|---|---|
+| CLIENT | POSSEDE | COMPTE | 0,n | 1,n |
+| AGENCE | GERE | COMPTE | 1,n | 1,1 |
+| AGENCE | EMPLOIE | EMPLOYE | 1,n | 1,1 |
+| EMPLOYE | CONSEILLE | CLIENT | 0,n | 0,1 |
+| COMPTE | EMET_CARTE | CARTE | 1,1 | 0,n |
+| COMPTE | EST_SOURCE | TRANSACTION | 1,1 | 0,n |
+| COMPTE | EST_DESTINATAIRE | TRANSACTION | 0,1 | 0,n |
 
-Chaque `schema.sql` a été validé sur PostgreSQL 16.
+CLIENT–COMPTE est une association porteuse (many-to-many, avec `role_titulaire`) : elle donnera une table à part entière au niveau logique.
 
-```bash
-createdb demo
-psql -d demo -f finance/oltp-comptes-bancaires/schema.sql
+## MLD
+
+```mermaid
+erDiagram
+    CLIENT {
+        int id_client PK
+        string nom
+        string prenom
+        date date_naissance
+        string email
+        int id_employe_conseiller FK
+    }
+    CLIENT_COMPTE {
+        int id_client PK,FK
+        int id_compte PK,FK
+        string role_titulaire
+    }
+    COMPTE {
+        int id_compte PK
+        string numero_compte
+        string type_compte
+        decimal solde
+        int id_agence FK
+    }
+    AGENCE {
+        int id_agence PK
+        string code_agence
+        string nom_agence
+    }
+    EMPLOYE {
+        int id_employe PK
+        string nom
+        int id_agence FK
+    }
+    CARTE {
+        int id_carte PK
+        string numero_carte
+        string type_carte
+        int id_compte FK
+    }
+    TRANSACTION {
+        int id_transaction PK
+        datetime date_heure
+        decimal montant
+        string type_transaction
+        int id_compte_source FK
+        int id_compte_destination FK
+    }
+
+    CLIENT ||--o{ CLIENT_COMPTE : ""
+    COMPTE ||--o{ CLIENT_COMPTE : ""
+    AGENCE ||--o{ COMPTE : ""
+    AGENCE ||--o{ EMPLOYE : ""
+    EMPLOYE |o--o{ CLIENT : ""
+    COMPTE ||--o{ CARTE : ""
+    COMPTE ||--o{ TRANSACTION : source
 ```
 
-## Licence
+Schéma normalisé (3FN) : `client_compte` absorbe le many-to-many, `transaction` porte deux FK vers `compte` (source obligatoire, destination optionnelle pour les virements internes).
 
-MIT, voir [LICENSE](LICENSE).
+## MPD
+
+→ [`schema.sql`](schema.sql), testé sur PostgreSQL 16.
+
+Points notables du physique :
+- `transaction` est partitionnée par mois (`date_heure`) — le volume d'écritures y est le plus élevé, et ça facilite l'archivage/l'extraction vers l'entrepôt du projet `finance/olap-risque-credit`.
+- Index limités aux besoins opérationnels réels (numéro de compte, historique par compte) plutôt qu'à tout ce qui pourrait servir un jour — chaque index a un coût à l'écriture.
+- Les `CHECK` sur `statut` et `type_*` remplacent des tables de référence pour rester simple ; à faire évoluer en tables si la liste des valeurs grandit.
