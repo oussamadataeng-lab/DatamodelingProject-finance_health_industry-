@@ -1,98 +1,82 @@
-# Comptes bancaires — OLTP
+# Risque de crédit — OLAP
 
-Base transactionnelle d'une banque : ouverture de comptes (parfois joints), cartes associées, et chaque mouvement (dépôt, retrait, virement, paiement) enregistré en temps réel. Le point sensible : un virement doit débiter et créditer dans la même transaction, sans jamais perdre de cohérence.
+Entrepôt pour la direction des risques : évolution du portefeuille de prêts, taux de défaut par segment/produit/agence/période, calcul des provisions. Alimenté par ETL nocturne depuis les systèmes OLTP (dont `finance/oltp-comptes-bancaires`) — aucune écriture interactive ici, que des lectures agrégées.
 
-## MCD
+Grain retenu : **un prêt, un jour d'observation**.
+
+## Modèle conceptuel (étoile)
 
 ```mermaid
 erDiagram
-    CLIENT ||--o{ CLIENT_COMPTE : possède
-    COMPTE ||--o{ CLIENT_COMPTE : "est possédé par"
-    AGENCE ||--o{ COMPTE : gère
-    AGENCE ||--o{ EMPLOYE : emploie
-    EMPLOYE |o--o{ CLIENT : conseille
-    COMPTE ||--o{ CARTE : possède
-    COMPTE ||--o{ TRANSACTION : "est source de"
-    COMPTE |o--o{ TRANSACTION : "est destinataire de"
+    FAIT_PRET }o--|| DIM_CLIENT : concerne
+    FAIT_PRET }o--|| DIM_TEMPS : "observé le"
+    FAIT_PRET }o--|| DIM_AGENCE : origine
+    FAIT_PRET }o--|| DIM_PRODUIT : "type de produit"
+    FAIT_PRET }o--|| DIM_SEGMENT_RISQUE : "classé en"
 ```
 
-| Entité 1 | Association | Entité 2 | Card. E1 | Card. E2 |
-|---|---|---|---|---|
-| CLIENT | POSSEDE | COMPTE | 0,n | 1,n |
-| AGENCE | GERE | COMPTE | 1,n | 1,1 |
-| AGENCE | EMPLOIE | EMPLOYE | 1,n | 1,1 |
-| EMPLOYE | CONSEILLE | CLIENT | 0,n | 0,1 |
-| COMPTE | EMET_CARTE | CARTE | 1,1 | 0,n |
-| COMPTE | EST_SOURCE | TRANSACTION | 1,1 | 0,n |
-| COMPTE | EST_DESTINATAIRE | TRANSACTION | 0,1 | 0,n |
+Toutes les dimensions sont en 1,n vers le fait. On modélise ici des axes d'analyse, pas des règles de gestion — c'est la différence avec un MCD côté OLTP.
 
-CLIENT–COMPTE est une association porteuse (many-to-many, avec `role_titulaire`) : elle donnera une table à part entière au niveau logique.
-
-## MLD
+## Modèle logique
 
 ```mermaid
 erDiagram
-    CLIENT {
-        int id_client PK
-        string nom
-        string prenom
-        date date_naissance
-        string email
-        int id_employe_conseiller FK
+    FAIT_PRET {
+        int id_client_sk FK
+        int id_temps_sk FK
+        int id_agence_sk FK
+        int id_produit_sk FK
+        int id_segment_sk FK
+        decimal montant_restant_du
+        decimal provision
+        int score_risque
+        boolean indicateur_defaut
     }
-    CLIENT_COMPTE {
-        int id_client PK,FK
-        int id_compte PK,FK
-        string role_titulaire
+    DIM_CLIENT {
+        int id_client_sk PK
+        int id_client_source
+        string segment_clientele
+        date date_debut_validite
+        date date_fin_validite
+        boolean est_version_courante
     }
-    COMPTE {
-        int id_compte PK
-        string numero_compte
-        string type_compte
-        decimal solde
-        int id_agence FK
+    DIM_TEMPS {
+        int id_temps_sk PK
+        date date_complete
+        int mois
+        int trimestre
+        int annee
     }
-    AGENCE {
-        int id_agence PK
+    DIM_AGENCE {
+        int id_agence_sk PK
         string code_agence
-        string nom_agence
+        string region
     }
-    EMPLOYE {
-        int id_employe PK
-        string nom
-        int id_agence FK
+    DIM_PRODUIT {
+        int id_produit_sk PK
+        string code_produit
+        string categorie
     }
-    CARTE {
-        int id_carte PK
-        string numero_carte
-        string type_carte
-        int id_compte FK
-    }
-    TRANSACTION {
-        int id_transaction PK
-        datetime date_heure
-        decimal montant
-        string type_transaction
-        int id_compte_source FK
-        int id_compte_destination FK
+    DIM_SEGMENT_RISQUE {
+        int id_segment_sk PK
+        string code_rating
+        decimal seuil_provision
     }
 
-    CLIENT ||--o{ CLIENT_COMPTE : ""
-    COMPTE ||--o{ CLIENT_COMPTE : ""
-    AGENCE ||--o{ COMPTE : ""
-    AGENCE ||--o{ EMPLOYE : ""
-    EMPLOYE |o--o{ CLIENT : ""
-    COMPTE ||--o{ CARTE : ""
-    COMPTE ||--o{ TRANSACTION : source
+    FAIT_PRET }o--|| DIM_CLIENT : ""
+    FAIT_PRET }o--|| DIM_TEMPS : ""
+    FAIT_PRET }o--|| DIM_AGENCE : ""
+    FAIT_PRET }o--|| DIM_PRODUIT : ""
+    FAIT_PRET }o--|| DIM_SEGMENT_RISQUE : ""
 ```
 
-Schéma normalisé (3FN) : `client_compte` absorbe le many-to-many, `transaction` porte deux FK vers `compte` (source obligatoire, destination optionnelle pour les virements internes).
+Deux choix qui font la différence avec le modèle OLTP :
 
-## MPD
+- **clés de substitution** (`*_sk`) plutôt que les clés métier, pour pouvoir historiser sans dépendre du système source ;
+- **`dim_client` en SCD2** — on garde la trace du segment de risque du client à chaque date d'observation, ce qui serait inutile (et coûteux) côté transactionnel où seul l'état courant compte.
 
-→ [`schema.sql`](schema.sql), testé sur PostgreSQL 16.
+## Physique
 
-Points notables du physique :
-- `transaction` est partitionnée par mois (`date_heure`) — le volume d'écritures y est le plus élevé, et ça facilite l'archivage/l'extraction vers l'entrepôt du projet `finance/olap-risque-credit`.
-- Index limités aux besoins opérationnels réels (numéro de compte, historique par compte) plutôt qu'à tout ce qui pourrait servir un jour — chaque index a un coût à l'écriture.
-- Les `CHECK` sur `statut` et `type_*` remplacent des tables de référence pour rester simple ; à faire évoluer en tables si la liste des valeurs grandit.
+→ [`schema.sql`](schema.sql).
+
+`fait_pret` est partitionnée par `id_temps_sk`, avec les dimensions de référence (agence, produit, segment) volontairement petites et dénormalisées pour rester bon marché à joindre. Le schéma est délibérément redondant par rapport au 3FN du système source : ici on optimise la lecture, pas l'espace disque.

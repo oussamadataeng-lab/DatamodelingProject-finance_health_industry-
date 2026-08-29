@@ -1,82 +1,70 @@
--- Comptes bancaires, cartes et transactions.
--- OLTP : normalisé, transactions courtes, index ciblés pour des lookups ponctuels.
+-- Entrepôt d'analyse du risque de crédit.
+-- Schéma en étoile alimenté par ETL depuis les systèmes OLTP (dont finance/oltp-comptes-bancaires).
+-- Grain : un prêt, un jour d'observation.
 
-CREATE TABLE agence (
-    id_agence     SERIAL PRIMARY KEY,
-    code_agence   VARCHAR(10) NOT NULL UNIQUE,
-    nom_agence    VARCHAR(100) NOT NULL,
-    ville         VARCHAR(80) NOT NULL
+CREATE TABLE dim_temps (
+    id_temps_sk    SERIAL PRIMARY KEY,
+    date_complete  DATE NOT NULL UNIQUE,
+    jour           SMALLINT NOT NULL,
+    mois           SMALLINT NOT NULL,
+    nom_mois       VARCHAR(15) NOT NULL,
+    trimestre      SMALLINT NOT NULL,
+    annee          SMALLINT NOT NULL
 );
 
-CREATE TABLE employe (
-    id_employe     SERIAL PRIMARY KEY,
-    nom            VARCHAR(80) NOT NULL,
-    prenom         VARCHAR(80) NOT NULL,
-    poste          VARCHAR(50) NOT NULL,
-    date_embauche  DATE NOT NULL,
-    id_agence      INT NOT NULL REFERENCES agence(id_agence)
+CREATE TABLE dim_agence (
+    id_agence_sk SERIAL PRIMARY KEY,
+    code_agence  VARCHAR(10) NOT NULL,
+    nom_agence   VARCHAR(100) NOT NULL,
+    ville        VARCHAR(80),
+    region       VARCHAR(80)
 );
 
-CREATE TABLE client (
-    id_client             SERIAL PRIMARY KEY,
-    nom                   VARCHAR(80) NOT NULL,
-    prenom                VARCHAR(80) NOT NULL,
-    date_naissance        DATE NOT NULL,
-    email                 VARCHAR(120) UNIQUE,
-    telephone             VARCHAR(20),
-    adresse               TEXT,
-    id_employe_conseiller INT REFERENCES employe(id_employe)
+CREATE TABLE dim_produit (
+    id_produit_sk SERIAL PRIMARY KEY,
+    code_produit  VARCHAR(15) NOT NULL,
+    nom_produit   VARCHAR(100) NOT NULL,
+    categorie     VARCHAR(50) NOT NULL
 );
 
-CREATE TABLE compte (
-    id_compte      SERIAL PRIMARY KEY,
-    numero_compte  VARCHAR(34) NOT NULL UNIQUE,  -- IBAN
-    type_compte    VARCHAR(20) NOT NULL CHECK (type_compte IN ('courant', 'epargne', 'professionnel')),
-    solde          NUMERIC(14,2) NOT NULL DEFAULT 0,
-    devise         CHAR(3) NOT NULL DEFAULT 'EUR',
-    date_ouverture DATE NOT NULL DEFAULT CURRENT_DATE,
-    statut         VARCHAR(15) NOT NULL DEFAULT 'actif' CHECK (statut IN ('actif', 'bloque', 'cloture')),
-    id_agence      INT NOT NULL REFERENCES agence(id_agence)
+CREATE TABLE dim_segment_risque (
+    id_segment_sk   SERIAL PRIMARY KEY,
+    code_rating     CHAR(1) NOT NULL,
+    libelle_rating  VARCHAR(50) NOT NULL,
+    seuil_provision NUMERIC(5,2) NOT NULL
 );
 
--- compte joint : un compte peut avoir plusieurs titulaires
-CREATE TABLE client_compte (
-    id_client        INT NOT NULL REFERENCES client(id_client),
-    id_compte        INT NOT NULL REFERENCES compte(id_compte),
-    role_titulaire   VARCHAR(20) NOT NULL CHECK (role_titulaire IN ('principal', 'cotitulaire')),
-    date_association DATE NOT NULL DEFAULT CURRENT_DATE,
-    PRIMARY KEY (id_client, id_compte)
+-- SCD type 2 : on garde l'historique des changements de segment client
+CREATE TABLE dim_client (
+    id_client_sk         SERIAL PRIMARY KEY,
+    id_client_source     INT NOT NULL,  -- clé métier côté OLTP
+    segment_clientele    VARCHAR(50),
+    tranche_revenu       VARCHAR(30),
+    region                VARCHAR(80),
+    date_debut_validite   DATE NOT NULL,
+    date_fin_validite     DATE,
+    est_version_courante  BOOLEAN NOT NULL DEFAULT TRUE
 );
+CREATE INDEX idx_dim_client_source ON dim_client(id_client_source, est_version_courante);
 
-CREATE TABLE carte (
-    id_carte        SERIAL PRIMARY KEY,
-    numero_carte    VARCHAR(20) NOT NULL UNIQUE,  -- à tokeniser en prod
-    type_carte      VARCHAR(15) NOT NULL CHECK (type_carte IN ('debit', 'credit')),
-    date_expiration DATE NOT NULL,
-    plafond         NUMERIC(10,2) NOT NULL,
-    statut          VARCHAR(15) NOT NULL DEFAULT 'active' CHECK (statut IN ('active', 'bloquee', 'expiree')),
-    id_compte       INT NOT NULL REFERENCES compte(id_compte)
-);
+CREATE TABLE fait_pret (
+    id_client_sk        INT NOT NULL REFERENCES dim_client(id_client_sk),
+    id_temps_sk         INT NOT NULL REFERENCES dim_temps(id_temps_sk),
+    id_agence_sk        INT NOT NULL REFERENCES dim_agence(id_agence_sk),
+    id_produit_sk        INT NOT NULL REFERENCES dim_produit(id_produit_sk),
+    id_segment_sk         INT NOT NULL REFERENCES dim_segment_risque(id_segment_sk),
+    montant_initial       NUMERIC(14,2) NOT NULL,
+    montant_restant_du    NUMERIC(14,2) NOT NULL,
+    montant_en_defaut     NUMERIC(14,2) NOT NULL DEFAULT 0,
+    provision             NUMERIC(14,2) NOT NULL DEFAULT 0,
+    score_risque          SMALLINT NOT NULL,
+    indicateur_defaut     BOOLEAN NOT NULL DEFAULT FALSE,
+    taux_interet          NUMERIC(5,3) NOT NULL,
+    PRIMARY KEY (id_client_sk, id_temps_sk, id_produit_sk)
+) PARTITION BY RANGE (id_temps_sk);
 
--- id_compte_destination reste vide sauf pour les virements internes
-CREATE TABLE transaction (
-    id_transaction         BIGSERIAL,
-    date_heure             TIMESTAMP NOT NULL DEFAULT now(),
-    montant                NUMERIC(14,2) NOT NULL CHECK (montant > 0),
-    type_transaction       VARCHAR(20) NOT NULL CHECK (type_transaction IN ('depot', 'retrait', 'virement', 'paiement')),
-    libelle                VARCHAR(150),
-    statut                 VARCHAR(15) NOT NULL DEFAULT 'validee' CHECK (statut IN ('en_attente', 'validee', 'rejetee')),
-    id_compte_source       INT NOT NULL REFERENCES compte(id_compte),
-    id_compte_destination  INT REFERENCES compte(id_compte),
-    PRIMARY KEY (id_transaction, date_heure)  -- postgres exige la clé de partition dans la PK
-) PARTITION BY RANGE (date_heure);
+CREATE TABLE fait_pret_defaut PARTITION OF fait_pret DEFAULT;
 
-CREATE TABLE transaction_2026_08 PARTITION OF transaction
-    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
-CREATE TABLE transaction_2026_09 PARTITION OF transaction
-    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
-
-CREATE INDEX idx_compte_numero ON compte(numero_compte);
-CREATE INDEX idx_transaction_compte_source ON transaction(id_compte_source, date_heure);
-CREATE INDEX idx_transaction_compte_dest ON transaction(id_compte_destination, date_heure);
-CREATE INDEX idx_client_email ON client(email);
+CREATE INDEX idx_fait_pret_temps ON fait_pret(id_temps_sk);
+CREATE INDEX idx_fait_pret_segment_temps ON fait_pret(id_segment_sk, id_temps_sk);
+CREATE INDEX idx_fait_pret_agence_temps ON fait_pret(id_agence_sk, id_temps_sk);
